@@ -1,0 +1,110 @@
+name: Terraform
+
+on:
+  pull_request:
+    paths: ['**.tf', '**.tfvars', 'stacks/**', '.github/workflows/infra.yml']
+  push:
+    branches: [main, staging, develop]
+    paths: ['**.tf', '**.tfvars', 'stacks/**']
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.10.5'
+
+jobs:
+  set-env:
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    outputs:
+      environment: ${{ steps.ctx.outputs.environment }}
+      stack: ${{ steps.ctx.outputs.stack }}
+    steps:
+      - id: ctx
+        run: |
+          REF="${{ github.base_ref || github.ref_name }}"
+          case "$REF" in
+            main)    echo "environment=prod"    >> $GITHUB_OUTPUT ;;
+            staging) echo "environment=staging" >> $GITHUB_OUTPUT ;;
+            *)       echo "environment=dev"     >> $GITHUB_OUTPUT ;;
+          esac
+          echo "stack=${{ vars.TF_STACK || 'web-app' }}" >> $GITHUB_OUTPUT
+
+  plan:
+    needs: set-env
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ needs.set-env.outputs.environment }}
+    env:
+      ENV: ${{ needs.set-env.outputs.environment }}
+      STACK: ${{ needs.set-env.outputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=${{ env.ENV }}/terraform.tfstate" -input=false
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="stacks/${{ env.STACK }}.tfvars" \
+            -var-file="environments/${{ env.ENV }}.tfvars" \
+            -no-color -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs')
+            let plan = fs.readFileSync('plan.txt', 'utf8')
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n...(truncated — see Actions log for full output)'
+            const status = '${{ steps.plan.outputs.exitcode }}' === '0' ? '✅' : '❌'
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${status} Terraform Plan — \`${{ env.STACK }}\` stack on \`${{ env.ENV }}\`\n\`\`\`hcl\n${plan}\n\`\`\``
+            })
+
+  apply:
+    needs: set-env
+    if: github.event_name == 'push'
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ needs.set-env.outputs.environment }}
+    env:
+      ENV: ${{ needs.set-env.outputs.environment }}
+      STACK: ${{ needs.set-env.outputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=${{ env.ENV }}/terraform.tfstate" -input=false
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var-file="stacks/${{ env.STACK }}.tfvars" \
+            -var-file="environments/${{ env.ENV }}.tfvars"

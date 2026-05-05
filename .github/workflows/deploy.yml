@@ -1,0 +1,139 @@
+name: Deploy Application
+
+on:
+  push:
+    branches: [main, staging, develop]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'Dockerfile'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy (frontend / backend / app)'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    outputs:
+      has_frontend: ${{ steps.detect.outputs.has_frontend }}
+      has_backend:  ${{ steps.detect.outputs.has_backend }}
+      has_root:     ${{ steps.detect.outputs.has_root }}
+      environment:  ${{ steps.ctx.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Dockerfiles
+        id: detect
+        run: |
+          echo "has_frontend=$([[ -f frontend/Dockerfile ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_backend=$([[ -f backend/Dockerfile ]]  && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_root=$([[ -f Dockerfile ]]             && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Resolve environment
+        id: ctx
+        run: |
+          case "${{ github.ref_name }}" in
+            main)    echo "environment=prod"    >> $GITHUB_OUTPUT ;;
+            staging) echo "environment=staging" >> $GITHUB_OUTPUT ;;
+            *)       echo "environment=dev"     >> $GITHUB_OUTPUT ;;
+          esac
+
+  build-push-deploy:
+    needs: detect
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ needs.detect.outputs.environment }}
+    env:
+      ENV:          ${{ needs.detect.outputs.environment }}
+      AWS_REGION:   ${{ vars.AWS_REGION }}
+      PROJECT_NAME: ${{ vars.PROJECT_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend
+        if: needs.detect.outputs.has_backend == 'true'
+        id: build-backend
+        env:
+          IMAGE_URI: ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENV }}/backend
+        run: |
+          docker build -t $IMAGE_URI:${{ github.sha }} -t $IMAGE_URI:latest ./backend
+          docker push $IMAGE_URI:${{ github.sha }}
+          docker push $IMAGE_URI:latest
+          echo "image_uri=$IMAGE_URI:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & push frontend
+        if: needs.detect.outputs.has_frontend == 'true'
+        id: build-frontend
+        env:
+          IMAGE_URI: ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENV }}/frontend
+        run: |
+          docker build -t $IMAGE_URI:${{ github.sha }} -t $IMAGE_URI:latest ./frontend
+          docker push $IMAGE_URI:${{ github.sha }}
+          docker push $IMAGE_URI:latest
+          echo "image_uri=$IMAGE_URI:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & push (root Dockerfile)
+        if: needs.detect.outputs.has_root == 'true' && needs.detect.outputs.has_backend == 'false'
+        id: build-root
+        env:
+          IMAGE_URI: ${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENV }}/app
+        run: |
+          docker build -t $IMAGE_URI:${{ github.sha }} -t $IMAGE_URI:latest .
+          docker push $IMAGE_URI:${{ github.sha }}
+          docker push $IMAGE_URI:latest
+          echo "image_uri=$IMAGE_URI:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      # Resolve the primary image URI (backend > root app)
+      - name: Resolve primary image
+        id: image
+        run: |
+          IMAGE="${{ steps.build-backend.outputs.image_uri || steps.build-root.outputs.image_uri }}"
+          echo "uri=${IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Update ECS task definition and deploy
+        if: steps.image.outputs.uri != ''
+        env:
+          CLUSTER: ${{ env.PROJECT_NAME }}-${{ env.ENV }}-cluster
+          SERVICE: ${{ env.PROJECT_NAME }}-${{ env.ENV }}-service
+          TASK_FAMILY: ${{ env.PROJECT_NAME }}-${{ env.ENV }}-task
+          NEW_IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          # Fetch current task definition and replace image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition $TASK_FAMILY \
+            --query 'taskDefinition' --output json)
+
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq \
+            --arg IMAGE "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.placementConstraints,.compatibilities,.registeredAt,.registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          aws ecs update-service \
+            --cluster $CLUSTER \
+            --service  $SERVICE \
+            --task-definition $NEW_TASK_ARN
+
+          echo "Waiting for service stability..."
+          aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE
+
+          echo "✅ Deployed $NEW_IMAGE to $SERVICE"
