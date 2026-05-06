@@ -46,7 +46,6 @@ jobs:
 
   plan:
     needs: set-env
-    if: github.event_name == 'pull_request'
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     environment: ${{ needs.set-env.outputs.environment }}
     env:
@@ -79,22 +78,30 @@ jobs:
 
       - name: Post plan to PR
         uses: actions/github-script@v7
-        if: always()
+        if: github.event_name == 'pull_request'
         with:
           script: |
             const fs = require('fs')
             let plan = fs.readFileSync('plan.txt', 'utf8')
             if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n...(truncated — see Actions log for full output)'
-            const status = '${{ steps.plan.outputs.exitcode }}' === '0' ? '✅' : '❌'
+            const status = '${{ steps.plan.outputs.exitcode }}' === '0' ? 'Plan OK' : 'Plan FAILED'
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## ${status} Terraform Plan — \`${{ env.STACK }}\` stack on \`${{ env.ENV }}\`\n\`\`\`hcl\n${plan}\n\`\`\``
+              body: `## ${status} — \`${{ env.STACK }}\` on \`${{ env.ENV }}\`\n\`\`\`hcl\n${plan}\n\`\`\``
             })
 
+      - name: Print plan summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "### Terraform Plan — ${{ env.STACK }} on ${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -30 plan.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
   apply:
-    needs: set-env
+    needs: [set-env, plan]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     environment: ${{ needs.set-env.outputs.environment }}
