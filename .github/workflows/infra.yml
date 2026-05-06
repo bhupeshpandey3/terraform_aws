@@ -1,6 +1,14 @@
 name: Terraform
 
 on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to apply'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
   pull_request:
     paths: ['**.tf', '**.tfvars', 'stacks/**', '.github/workflows/infra.yml']
   push:
@@ -24,12 +32,16 @@ jobs:
     steps:
       - id: ctx
         run: |
-          REF="${{ github.base_ref || github.ref_name }}"
-          case "$REF" in
-            prod)    echo "environment=prod"    >> $GITHUB_OUTPUT ;;
-            staging) echo "environment=staging" >> $GITHUB_OUTPUT ;;
-            *)       echo "environment=dev"     >> $GITHUB_OUTPUT ;;
-          esac
+          if [ -n "${{ github.event.inputs.environment }}" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            REF="${{ github.base_ref || github.ref_name }}"
+            case "$REF" in
+              prod)    echo "environment=prod"    >> $GITHUB_OUTPUT ;;
+              staging) echo "environment=staging" >> $GITHUB_OUTPUT ;;
+              *)       echo "environment=dev"     >> $GITHUB_OUTPUT ;;
+            esac
+          fi
           echo "stack=${{ vars.TF_STACK || 'web-app' }}" >> $GITHUB_OUTPUT
 
   plan:
