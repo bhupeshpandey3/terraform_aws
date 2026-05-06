@@ -92,7 +92,7 @@ resource "aws_iam_instance_profile" "runner" {
 
 resource "aws_security_group" "runner" {
   name        = "${var.project_name}-github-runner"
-  description = "GitHub Actions self-hosted runner — outbound only"
+  description = "GitHub Actions self-hosted runner - outbound only"
   vpc_id      = data.aws_vpc.default.id
 
   egress {
@@ -117,14 +117,14 @@ locals {
     #!/bin/bash
     set -euxo pipefail
 
-    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    REGION="${var.aws_region}"
     GITHUB_ORG="${var.github_org}"
     GITHUB_REPO="${var.github_repo}"
     RUNNER_VERSION="${var.runner_version}"
 
     # ── System packages ────────────────────────────────────────────────────────
     dnf update -y
-    dnf install -y git jq curl unzip docker libicu
+    dnf install -y --allowerasing git jq curl unzip docker libicu
 
     systemctl enable --now docker
 
@@ -147,7 +147,7 @@ locals {
     tar xzf /tmp/runner.tar.gz -C "$RUNNER_DIR"
     chown -R runner:runner /home/runner
 
-    "$RUNNER_DIR/bin/installdependencies.sh"
+    "$RUNNER_DIR/bin/installdependencies.sh" || true
 
     # ── Registration token from PAT stored in SSM ──────────────────────────────
     PAT=$(aws ssm get-parameter \
