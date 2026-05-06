@@ -1,0 +1,214 @@
+name: Infrastructure Health Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to check'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+  schedule:
+    - cron: '0 8 * * MON-FRI'   # daily at 8 AM UTC on weekdays
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+
+jobs:
+  health-check:
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    env:
+      ENV: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=${{ env.ENV }}/terraform.tfstate" -input=false
+
+      - name: Terraform Outputs
+        id: tf_out
+        run: |
+          terraform output -json > tf_outputs.json 2>/dev/null || echo "{}" > tf_outputs.json
+          cat tf_outputs.json
+
+      - name: Check ECS Service Health
+        id: ecs
+        run: |
+          PREFIX=$(cat tf_outputs.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ecs_service_name',{}).get('value',''))" 2>/dev/null || echo "")
+          CLUSTER=$(cat tf_outputs.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ecs_cluster_name',{}).get('value',''))" 2>/dev/null || echo "")
+
+          if [ -z "$CLUSTER" ]; then
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "detail=ECS not enabled or no output" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          RESULT=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$PREFIX" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "services[0].{status:status,running:runningCount,desired:desiredCount}" \
+            --output json 2>&1 || echo '{}')
+
+          RUNNING=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('running',0))")
+          DESIRED=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('desired',0))")
+
+          if [ "$RUNNING" -eq "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "detail=running=$RUNNING desired=$DESIRED" >> $GITHUB_OUTPUT
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "detail=running=$RUNNING desired=$DESIRED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check ALB Target Health
+        id: alb
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --region "${{ env.AWS_REGION }}" \
+            --query "TargetGroups[?contains(TargetGroupName, '${{ env.ENV }}')].TargetGroupArn" \
+            --output text 2>/dev/null | head -1)
+
+          if [ -z "$TG_ARN" ]; then
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "detail=No ALB target group found" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          HEALTH=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TG_ARN" \
+            --region "${{ env.AWS_REGION }}" \
+            --query "TargetHealthDescriptions[].TargetHealth.State" \
+            --output json 2>/dev/null || echo '[]')
+
+          HEALTHY=$(echo "$HEALTH" | python3 -c "import sys,json; h=json.load(sys.stdin); print(h.count('healthy'))")
+          TOTAL=$(echo "$HEALTH"   | python3 -c "import sys,json; h=json.load(sys.stdin); print(len(h))")
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "status=no-targets" >> $GITHUB_OUTPUT
+            echo "detail=No registered targets (service may be stopped)" >> $GITHUB_OUTPUT
+          elif [ "$HEALTHY" -eq "$TOTAL" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "detail=$HEALTHY/$TOTAL targets healthy" >> $GITHUB_OUTPUT
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "detail=$HEALTHY/$TOTAL targets healthy" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RDS Status
+        id: rds
+        run: |
+          STATUS=$(aws rds describe-db-instances \
+            --region "${{ env.AWS_REGION }}" \
+            --query "DBInstances[?contains(DBInstanceIdentifier, '${{ env.ENV }}')].DBInstanceStatus" \
+            --output text 2>/dev/null)
+
+          if [ -z "$STATUS" ]; then
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "detail=No RDS instance found" >> $GITHUB_OUTPUT
+          elif [ "$STATUS" = "available" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "detail=RDS status: $STATUS" >> $GITHUB_OUTPUT
+          else
+            echo "status=degraded" >> $GITHUB_OUTPUT
+            echo "detail=RDS status: $STATUS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check ECR Repos
+        id: ecr
+        run: |
+          COUNT=$(aws ecr describe-repositories \
+            --region "${{ env.AWS_REGION }}" \
+            --query "length(repositories[?contains(repositoryName, '${{ env.ENV }}')])" \
+            --output text 2>/dev/null || echo "0")
+
+          echo "status=ok" >> $GITHUB_OUTPUT
+          echo "detail=$COUNT ECR repositories" >> $GITHUB_OUTPUT
+
+      - name: Check Terraform Drift
+        id: drift
+        run: |
+          terraform plan \
+            -var-file="stacks/${{ vars.TF_STACK || 'web-app' }}.tfvars" \
+            -var-file="environments/${{ env.ENV }}.tfvars" \
+            -detailed-exitcode -no-color 2>&1 > drift.txt || true
+
+          EXIT_CODE=$?
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+            echo "detail=No drift detected" >> $GITHUB_OUTPUT
+          elif [ "$EXIT_CODE" -eq 2 ]; then
+            CHANGES=$(grep -c "^  [+~-]" drift.txt 2>/dev/null || echo "?")
+            echo "status=drifted" >> $GITHUB_OUTPUT
+            echo "detail=$CHANGES resource changes pending" >> $GITHUB_OUTPUT
+          else
+            echo "status=error" >> $GITHUB_OUTPUT
+            echo "detail=Plan failed — check logs" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Health Report
+        id: report
+        run: |
+          icon() { case "$1" in healthy|clean|ok) echo "✅";; skipped|no-targets) echo "⏭️";; *) echo "❌";; esac; }
+          cat <<EOF > report.md
+          ## Infrastructure Health Report — \`${{ env.ENV }}\` — $(date -u '+%Y-%m-%d %H:%M UTC')
+
+          | Component | Status | Detail |
+          |-----------|--------|--------|
+          | ECS Service  | $(icon "${{ steps.ecs.outputs.status }}")  ${{ steps.ecs.outputs.status }}  | ${{ steps.ecs.outputs.detail }}  |
+          | ALB Targets  | $(icon "${{ steps.alb.outputs.status }}")  ${{ steps.alb.outputs.status }}  | ${{ steps.alb.outputs.detail }}  |
+          | RDS Database | $(icon "${{ steps.rds.outputs.status }}")  ${{ steps.rds.outputs.status }}  | ${{ steps.rds.outputs.detail }}  |
+          | ECR          | $(icon "${{ steps.ecr.outputs.status }}")  ${{ steps.ecr.outputs.status }}  | ${{ steps.ecr.outputs.detail }}  |
+          | Terraform    | $(icon "${{ steps.drift.outputs.status }}") ${{ steps.drift.outputs.status }} | ${{ steps.drift.outputs.detail }} |
+          EOF
+          cat report.md
+
+      - name: Print Report
+        run: cat report.md
+
+      - name: Open issue if unhealthy
+        if: |
+          contains(steps.ecs.outputs.status, 'unhealthy') ||
+          contains(steps.alb.outputs.status, 'unhealthy') ||
+          contains(steps.rds.outputs.status, 'degraded') ||
+          contains(steps.drift.outputs.status, 'drifted')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const body = fs.readFileSync('report.md', 'utf8')
+            const label = 'health:${{ env.ENV }}'
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              labels: label, state: 'open'
+            })
+            if (issues.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issues[0].number, body
+              })
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `[health] Infrastructure issues detected in ${process.env.ENV}`,
+                body, labels: [label]
+              })
+            }
+        env:
+          ENV: ${{ env.ENV }}

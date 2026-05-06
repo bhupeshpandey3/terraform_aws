@@ -1,0 +1,71 @@
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      stack:
+        description: 'Stack to destroy'
+        required: true
+        default: 'web-app'
+        type: string
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Confirm destroy intent
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
+            echo "::error::Confirmation text must be exactly 'destroy'. Got: '${{ github.event.inputs.confirm }}'"
+            exit 1
+          fi
+          echo "Confirmation accepted. Proceeding with destroy of ${{ github.event.inputs.environment }}."
+
+  destroy:
+    needs: validate
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENV:   ${{ github.event.inputs.environment }}
+      STACK: ${{ github.event.inputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.10.5'
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=${{ env.ENV }}/terraform.tfstate" -input=false
+
+      - name: Terraform Plan Destroy
+        run: |
+          terraform plan -destroy \
+            -var-file="stacks/${{ env.STACK }}.tfvars" \
+            -var-file="environments/${{ env.ENV }}.tfvars" \
+            -no-color 2>&1 | tee destroy-plan.txt
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy -auto-approve \
+            -var-file="stacks/${{ env.STACK }}.tfvars" \
+            -var-file="environments/${{ env.ENV }}.tfvars"
