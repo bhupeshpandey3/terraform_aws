@@ -38,7 +38,7 @@ db_username                = "admin"
 db_password                = "ChangeMe123!"
 db_allocated_storage       = 100
 db_multi_az                = true
-db_deletion_protection     = true
+db_deletion_protection     = false
 db_backup_retention_period = 14
 
 # S3

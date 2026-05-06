@@ -26,7 +26,7 @@ jobs:
         run: |
           REF="${{ github.base_ref || github.ref_name }}"
           case "$REF" in
-            main)    echo "environment=prod"    >> $GITHUB_OUTPUT ;;
+            prod)    echo "environment=prod"    >> $GITHUB_OUTPUT ;;
             staging) echo "environment=staging" >> $GITHUB_OUTPUT ;;
             *)       echo "environment=dev"     >> $GITHUB_OUTPUT ;;
           esac
