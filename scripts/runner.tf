@@ -124,7 +124,9 @@ locals {
 
     # ── System packages ────────────────────────────────────────────────────────
     dnf update -y
-    dnf install -y --allowerasing git jq curl unzip docker libicu
+    dnf install -y --allowerasing git jq curl unzip docker libicu nodejs20
+    ln -sf /usr/bin/node20 /usr/local/bin/node
+    ln -sf /usr/bin/npm-20 /usr/local/bin/npm
 
     systemctl enable --now docker
 
