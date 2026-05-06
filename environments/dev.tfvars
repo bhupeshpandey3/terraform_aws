@@ -3,6 +3,13 @@ project_name = "myapp"
 aws_region   = "us-east-2"
 
 # Dev-specific feature overrides (stack sets the baseline)
+enable_s3         = true
+enable_alb        = true
+enable_rds        = true
+enable_ecs        = true
+enable_ecr        = true
+enable_cloudfront = false
+enable_eks        = false
 enable_nat_gateway = false   # saves ~$65/month in dev
 enable_scheduler   = true
 

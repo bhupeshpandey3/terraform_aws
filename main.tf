@@ -103,11 +103,7 @@ module "ecs" {
   alb_security_group_id = try(module.alb[0].alb_security_group_id, "")
   launch_type           = var.ecs_launch_type
   desired_count         = var.ecs_desired_count
-  container_image = var.enable_ecr ? coalesce(
-    try(module.ecr[0].repository_urls["backend"], ""),
-    try(module.ecr[0].repository_urls["app"], ""),
-    var.container_image
-  ) : var.container_image
+  container_image       = var.container_image
   container_port        = var.container_port
   container_cpu         = var.container_cpu
   container_memory      = var.container_memory
