@@ -5,7 +5,7 @@ aws_region   = "us-east-2"
 # Dev-specific feature overrides (stack sets the baseline)
 enable_s3         = true
 enable_alb        = true
-enable_rds        = true
+enable_rds        = false
 enable_ecs        = true
 enable_ecr        = true
 enable_cloudfront = false
