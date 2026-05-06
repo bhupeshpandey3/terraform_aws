@@ -105,9 +105,13 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     environment: ${{ needs.set-env.outputs.environment }}
+    concurrency:
+      group: terraform-apply-${{ needs.set-env.outputs.environment }}
+      cancel-in-progress: false
     env:
       ENV: ${{ needs.set-env.outputs.environment }}
       STACK: ${{ needs.set-env.outputs.stack }}
+      TF_BUCKET: myapp-tfstate-685197708357
     steps:
       - uses: actions/checkout@v4
 
@@ -115,6 +119,11 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Clear stale state lock
+        run: |
+          aws s3 rm "s3://${{ env.TF_BUCKET }}/${{ env.ENV }}/terraform.tfstate.tflock" \
+            --region ${{ vars.AWS_REGION }} 2>/dev/null || true
 
       - uses: hashicorp/setup-terraform@v3
         with:
