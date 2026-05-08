@@ -125,6 +125,26 @@ jobs:
           aws s3 rm "s3://${{ env.TF_BUCKET }}/${{ env.ENV }}/terraform.tfstate.tflock" \
             --region ${{ vars.AWS_REGION }} 2>/dev/null || true
 
+      - name: Detect state/AWS drift
+        run: |
+          # Check if state is empty (0 resources) — if so, warn loudly.
+          # An empty state with existing AWS resources causes ResourceAlreadyExists on apply.
+          STATE=$(aws s3 cp "s3://${{ env.TF_BUCKET }}/${{ env.ENV }}/terraform.tfstate" - \
+            --region ${{ vars.AWS_REGION }} 2>/dev/null || echo '{"serial":0,"resources":[]}')
+          RESOURCE_COUNT=$(echo "$STATE" | jq '.resources | length')
+          echo "State resource count: ${RESOURCE_COUNT}"
+          if [ "$RESOURCE_COUNT" -eq 0 ]; then
+            # Check if a VPC with our name already exists — proxy for orphaned resources
+            VPC=$(aws ec2 describe-vpcs --region ${{ vars.AWS_REGION }} \
+              --filters "Name=tag:Name,Values=myapp-${{ env.ENV }}-vpc" \
+              --query 'Vpcs[*].VpcId' --output text 2>/dev/null || true)
+            if [ -n "$VPC" ]; then
+              echo "::error::State is empty but AWS resources exist (VPC: ${VPC})."
+              echo "::error::Run the 'Force Cleanup (Emergency)' workflow first, then re-apply."
+              exit 1
+            fi
+          fi
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}

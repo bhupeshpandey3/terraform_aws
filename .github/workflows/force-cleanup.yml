@@ -1,0 +1,83 @@
+name: Force Cleanup (Emergency)
+
+# Emergency workflow: deletes ALL tagged AWS resources for an environment in
+# the correct dependency order, then wipes the Terraform state from S3.
+# Use this when terraform state is out of sync with AWS (orphaned resources).
+# After this runs, the next infra.yml apply starts completely fresh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to nuke'
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      confirm:
+        description: 'Type "nuke <environment>" to confirm (e.g. "nuke dev")'
+        required: true
+        type: string
+      clear_state:
+        description: 'Also wipe the Terraform state from S3 (required for a clean re-apply)'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_BUCKET: myapp-tfstate-685197708357
+
+jobs:
+  guard:
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Validate confirmation
+        run: |
+          EXPECTED="nuke ${{ github.event.inputs.environment }}"
+          if [ "${{ github.event.inputs.confirm }}" != "$EXPECTED" ]; then
+            echo "::error::Confirmation must be exactly \"${EXPECTED}\". Got: \"${{ github.event.inputs.confirm }}\""
+            exit 1
+          fi
+          echo "Confirmation accepted. Will nuke ${{ github.event.inputs.environment }}."
+
+  cleanup:
+    needs: guard
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENV: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Make script executable
+        run: chmod +x scripts/force-cleanup.sh
+
+      - name: Run force cleanup
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.clear_state }}" = "true" ]; then
+            EXTRA_ARGS="--clear-state --state-bucket ${{ env.TF_BUCKET }}"
+          fi
+
+          bash scripts/force-cleanup.sh \
+            --environment "${{ env.ENV }}" \
+            --project myapp \
+            --region ${{ vars.AWS_REGION }} \
+            $EXTRA_ARGS
+
+      - name: Summary
+        run: |
+          echo "### Force Cleanup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ env.ENV }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **State cleared:** ${{ github.event.inputs.clear_state }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next step:** Run the [Terraform workflow](../infra.yml) with \`environment=${{ env.ENV }}\` to re-provision." >> $GITHUB_STEP_SUMMARY
