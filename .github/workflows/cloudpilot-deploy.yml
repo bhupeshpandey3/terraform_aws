@@ -305,6 +305,7 @@ jobs:
 
       - name: Upload Outputs Artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: cloudpilot-outputs-${{ inputs.project_id }}
           path: cloudpilot-outputs.json
