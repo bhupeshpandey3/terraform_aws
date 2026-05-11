@@ -69,7 +69,7 @@ on:
 jobs:
   deploy:
     name: "Deploy ${{ inputs.stack_type }} to ${{ inputs.environment }}"
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
 
