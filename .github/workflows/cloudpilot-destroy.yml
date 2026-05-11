@@ -1,4 +1,4 @@
-name: "CloudPilot: Destroy Infrastructure"
+name: "CloudPilot Destroy Infrastructure"
 
 on:
   workflow_dispatch:
@@ -15,12 +15,19 @@ on:
         description: "Environment to destroy"
         required: true
         type: choice
-        options: [dev, staging, prod]
+        options:
+          - dev
+          - staging
+          - prod
       stack_type:
         description: "Infrastructure stack type"
         required: true
         type: choice
-        options: [web-app, api-backend, static-site, microservices]
+        options:
+          - web-app
+          - api-backend
+          - static-site
+          - microservices
         default: web-app
       aws_region:
         description: "AWS region"
@@ -127,12 +134,12 @@ print('Generated destroy tfvars')
             -backend-config="key=cloudpilot/${{ inputs.project_id }}/terraform.tfstate" \
             -input=false -no-color
 
-      - name: Terraform Plan (destroy preview)
+      - name: Terraform Plan Destroy
         run: |
           terraform plan -destroy \
             -var-file="cloudpilot.auto.tfvars.json" \
             -input=false -no-color 2>&1 | tee destroy-plan.log
-          echo "### Terraform Destroy Plan — ${{ inputs.project_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Terraform Destroy Plan - ${{ inputs.project_name }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           tail -30 destroy-plan.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -143,16 +150,16 @@ print('Generated destroy tfvars')
             -var-file="cloudpilot.auto.tfvars.json" \
             -input=false -auto-approve 2>&1 | tee destroy.log
 
-      - name: Notify CloudPilot (success)
+      - name: Notify CloudPilot on success
         if: success() && inputs.callback_url != ''
         run: |
           curl -fsSL -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"destroyed\"}" || true
 
-      - name: Notify CloudPilot (failure)
+      - name: Notify CloudPilot on failure
         if: failure() && inputs.callback_url != ''
         run: |
           curl -fsSL -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"failed\",\"error\":\"Destroy failed — see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"failed\",\"error\":\"Destroy failed - see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
