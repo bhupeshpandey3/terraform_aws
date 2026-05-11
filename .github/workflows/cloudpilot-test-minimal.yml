@@ -1,4 +1,4 @@
-name: CloudPilot Test With Inputs
+name: CloudPilot Test Python Run
 
 on:
   workflow_dispatch:
@@ -16,24 +16,25 @@ on:
           - staging
           - prod
         default: dev
-      stack_type:
-        description: "Infrastructure stack template"
-        required: true
-        type: choice
-        options:
-          - web-app
-          - api-backend
-          - static-site
-        default: web-app
-      enable_rds:
-        description: "Provision RDS (true/false)"
-        required: false
-        type: string
-        default: "false"
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ inputs.project_id }}
+      ENVIRONMENT: ${{ inputs.environment }}
     steps:
-      - name: Echo
-        run: echo "env=${{ inputs.environment }} stack=${{ inputs.stack_type }}"
+      - name: Generate vars
+        run: |
+          python3 -c "
+import json, os
+data = {
+    'environment': os.environ['ENVIRONMENT'],
+    'project_id':  os.environ['PROJECT_ID'],
+    'enable_s3':   False,
+    'enable_alb':  True,
+}
+with open('test.json', 'w') as f:
+    json.dump(data, f, indent=2)
+print(json.dumps(data, indent=2))
+"
