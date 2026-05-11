@@ -1,0 +1,16 @@
+name: CloudPilot Test Minimal
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: test input
+        required: true
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo
+        run: echo "project=${{ inputs.project_id }}"
