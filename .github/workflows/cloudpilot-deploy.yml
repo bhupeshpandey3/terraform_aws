@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       project_id:
-        description: "CloudPilot project UUID (used for state isolation)"
+        description: "CloudPilot project UUID (state isolation key)"
         required: true
         type: string
       project_name:
@@ -115,6 +115,7 @@ jobs:
           echo "db_name=${DB_NAME:-appdb}" >> $GITHUB_OUTPUT
 
       - name: Generate Terraform Variables
+        id: tfvars
         env:
           ENVIRONMENT:     ${{ inputs.environment }}
           PROJECT_NAME:    ${{ inputs.project_name }}
@@ -140,66 +141,78 @@ jobs:
           [[ "$ENVIRONMENT" == "prod" ]] && ENABLE_NAT=true || ENABLE_NAT=false
           [[ "$ENVIRONMENT" == "prod" ]] && ECS_COUNT=2 || ECS_COUNT=1
 
-          export ENABLE_S3 ENABLE_ALB ENABLE_ECS ENABLE_ECR ENABLE_NAT ECS_COUNT
+          jq -n \
+            --arg  environment          "$ENVIRONMENT" \
+            --arg  project_name         "$PROJECT_NAME" \
+            --arg  aws_region           "$AWS_REGION" \
+            --arg  az1                  "$AZ1" \
+            --arg  az2                  "$AZ2" \
+            --arg  container_image      "$CONTAINER_IMAGE" \
+            --arg  db_name              "$DB_NAME" \
+            --arg  db_password          "$DB_PASSWORD" \
+            --arg  s3_bucket_name       "$S3_BUCKET" \
+            --argjson enable_s3         $ENABLE_S3 \
+            --argjson enable_alb        $ENABLE_ALB \
+            --argjson enable_ecs        $ENABLE_ECS \
+            --argjson enable_ecr        $ENABLE_ECR \
+            --argjson enable_rds        ${ENABLE_RDS:-false} \
+            --argjson enable_nat        $ENABLE_NAT \
+            --argjson enable_cf         ${ENABLE_CF:-false} \
+            --argjson container_port    ${CONTAINER_PORT:-80} \
+            --argjson ecs_count         $ECS_COUNT \
+            '{
+              environment:          $environment,
+              project_name:         $project_name,
+              aws_region:           $aws_region,
+              vpc_cidr:             "10.0.0.0/16",
+              availability_zones:   [$az1, $az2],
+              public_subnet_cidrs:  ["10.0.1.0/24", "10.0.2.0/24"],
+              private_subnet_cidrs: ["10.0.10.0/24", "10.0.11.0/24"],
+              enable_s3:            $enable_s3,
+              enable_alb:           $enable_alb,
+              enable_ecs:           $enable_ecs,
+              enable_ecr:           $enable_ecr,
+              enable_rds:           $enable_rds,
+              enable_nat_gateway:   $enable_nat,
+              enable_scheduler:     false,
+              enable_cloudfront:    $enable_cf,
+              enable_eks:           false,
+              container_image:      $container_image,
+              container_port:       $container_port,
+              container_cpu:        256,
+              container_memory:     512,
+              ecs_launch_type:      "FARGATE",
+              ecs_desired_count:    $ecs_count,
+              s3_bucket_name:       $s3_bucket_name,
+              s3_versioning_enabled: false,
+              alb_internal:         false,
+              health_check_path:    "/",
+              certificate_arn:      "",
+              cloudfront_origin_verify_secret: "cloudpilot-change-me",
+              cloudfront_price_class: "PriceClass_100",
+              cloudfront_acm_certificate_arn: "",
+              db_engine:            "mysql",
+              db_engine_version:    "8.0",
+              db_instance_class:    "db.t3.micro",
+              db_name:              $db_name,
+              db_username:          "admin",
+              db_password:          $db_password,
+              db_allocated_storage: 20,
+              db_multi_az:          false,
+              db_deletion_protection: false,
+              db_backup_retention_period: 7,
+              ecr_repositories:     ["app"],
+              ec2_instance_type:    "t3.medium",
+              ec2_desired_capacity: 1,
+              ec2_min_size:         1,
+              ec2_max_size:         2,
+              schedule_stop_cron:   "cron(0 20 * * ? *)",
+              schedule_start_cron:  "cron(0 8 * * ? *)",
+              schedule_desired_count: 1
+            }' > cloudpilot.auto.tfvars.json
 
-          python3 -c "
-import json, os
-
-data = {
-    'environment':          os.environ['ENVIRONMENT'],
-    'project_name':         os.environ['PROJECT_NAME'],
-    'aws_region':           os.environ['AWS_REGION'],
-    'vpc_cidr':             '10.0.0.0/16',
-    'availability_zones':   [os.environ['AZ1'], os.environ['AZ2']],
-    'public_subnet_cidrs':  ['10.0.1.0/24', '10.0.2.0/24'],
-    'private_subnet_cidrs': ['10.0.10.0/24', '10.0.11.0/24'],
-    'enable_s3':            os.environ['ENABLE_S3'] == 'true',
-    'enable_alb':           os.environ['ENABLE_ALB'] == 'true',
-    'enable_ecs':           os.environ['ENABLE_ECS'] == 'true',
-    'enable_ecr':           os.environ['ENABLE_ECR'] == 'true',
-    'enable_rds':           os.environ['ENABLE_RDS'] == 'true',
-    'enable_nat_gateway':   os.environ['ENABLE_NAT'] == 'true',
-    'enable_scheduler':     False,
-    'enable_cloudfront':    os.environ['ENABLE_CF'] == 'true',
-    'enable_eks':           False,
-    'container_image':      os.environ['CONTAINER_IMAGE'],
-    'container_port':       int(os.environ['CONTAINER_PORT']),
-    'container_cpu':        256,
-    'container_memory':     512,
-    'ecs_launch_type':      'FARGATE',
-    'ecs_desired_count':    int(os.environ['ECS_COUNT']),
-    's3_bucket_name':       os.environ['S3_BUCKET'],
-    's3_versioning_enabled': False,
-    'alb_internal':         False,
-    'health_check_path':    '/',
-    'certificate_arn':      '',
-    'cloudfront_origin_verify_secret': 'cloudpilot-change-me',
-    'cloudfront_price_class': 'PriceClass_100',
-    'cloudfront_acm_certificate_arn': '',
-    'db_engine':            'mysql',
-    'db_engine_version':    '8.0',
-    'db_instance_class':    'db.t3.micro',
-    'db_name':              os.environ['DB_NAME'],
-    'db_username':          'admin',
-    'db_password':          os.environ['DB_PASSWORD'],
-    'db_allocated_storage': 20,
-    'db_multi_az':          False,
-    'db_deletion_protection': False,
-    'db_backup_retention_period': 7,
-    'ecr_repositories':     ['app'],
-    'ec2_instance_type':    't3.medium',
-    'ec2_desired_capacity': 1,
-    'ec2_min_size':         1,
-    'ec2_max_size':         2,
-    'schedule_stop_cron':   'cron(0 20 * * ? *)',
-    'schedule_start_cron':  'cron(0 8 * * ? *)',
-    'schedule_desired_count': 1,
-}
-with open('cloudpilot.auto.tfvars.json', 'w') as f:
-    json.dump(data, f, indent=2)
-print('Generated cloudpilot.auto.tfvars.json')
-print(json.dumps(data, indent=2))
-"
+          echo "--- Generated tfvars ---"
+          cat cloudpilot.auto.tfvars.json
 
       - name: Terraform Init
         run: |
@@ -238,7 +251,7 @@ print(json.dumps(data, indent=2))
           echo "cf=$CFD"  >> $GITHUB_OUTPUT
           echo "vpc=$VPC" >> $GITHUB_OUTPUT
 
-      - name: Build CloudPilot Outputs JSON
+      - name: Build and upload outputs artifact
         env:
           PROJECT_ID:  ${{ inputs.project_id }}
           ENVIRONMENT: ${{ inputs.environment }}
@@ -252,35 +265,43 @@ print(json.dumps(data, indent=2))
           VPC_ID:      ${{ steps.out.outputs.vpc }}
           RUN_ID:      ${{ github.run_id }}
         run: |
-          python3 -c "
-import json, os
-alb = os.environ.get('ALB_DNS', '')
-cf  = os.environ.get('CF_DOMAIN', '')
-app_url = ('https://' + cf) if cf else ('http://' + alb) if alb else ''
+          APP_URL=""
+          [[ -n "$CF_DOMAIN" ]] && APP_URL="https://${CF_DOMAIN}"
+          [[ -z "$APP_URL" && -n "$ALB_DNS" ]] && APP_URL="http://${ALB_DNS}"
 
-with open('raw_outputs.json') as f:
-    tf_out = json.load(f)
+          jq -n \
+            --arg project_id       "$PROJECT_ID" \
+            --arg workflow_run_id  "$RUN_ID" \
+            --arg environment      "$ENVIRONMENT" \
+            --arg aws_region       "$AWS_REGION" \
+            --arg stack_type       "$STACK_TYPE" \
+            --arg app_url          "$APP_URL" \
+            --arg alb_dns_name     "$ALB_DNS" \
+            --arg ecs_cluster_name "$ECS_CLUSTER" \
+            --arg ecs_service_name "$ECS_SVC" \
+            --arg s3_bucket_name   "$S3_BUCKET" \
+            --arg cloudfront_domain "$CF_DOMAIN" \
+            --arg vpc_id           "$VPC_ID" \
+            --slurpfile tf_out raw_outputs.json \
+            '{
+              project_id:       $project_id,
+              workflow_run_id:  $workflow_run_id,
+              status:           "deployed",
+              environment:      $environment,
+              aws_region:       $aws_region,
+              stack_type:       $stack_type,
+              app_url:          $app_url,
+              alb_dns_name:     $alb_dns_name,
+              ecs_cluster_name: $ecs_cluster_name,
+              ecs_service_name: $ecs_service_name,
+              s3_bucket_name:   $s3_bucket_name,
+              cloudfront_domain: $cloudfront_domain,
+              vpc_id:           $vpc_id,
+              terraform_outputs: $tf_out[0]
+            }' > cloudpilot-outputs.json
 
-result = {
-    'project_id':       os.environ['PROJECT_ID'],
-    'workflow_run_id':  os.environ['RUN_ID'],
-    'status':           'deployed',
-    'environment':      os.environ['ENVIRONMENT'],
-    'aws_region':       os.environ['AWS_REGION'],
-    'stack_type':       os.environ['STACK_TYPE'],
-    'app_url':          app_url,
-    'alb_dns_name':     alb,
-    'ecs_cluster_name': os.environ.get('ECS_CLUSTER', ''),
-    'ecs_service_name': os.environ.get('ECS_SVC', ''),
-    's3_bucket_name':   os.environ.get('S3_BUCKET', ''),
-    'cloudfront_domain': cf,
-    'vpc_id':           os.environ.get('VPC_ID', ''),
-    'terraform_outputs': tf_out,
-}
-with open('cloudpilot-outputs.json', 'w') as f:
-    json.dump(result, f, indent=2)
-print(json.dumps(result, indent=2))
-"
+          echo "--- Deployment Outputs ---"
+          cat cloudpilot-outputs.json
 
       - name: Upload Outputs Artifact
         uses: actions/upload-artifact@v4
@@ -291,6 +312,9 @@ print(json.dumps(result, indent=2))
 
       - name: Write Job Summary
         if: always()
+        env:
+          ALB: ${{ steps.out.outputs.alb }}
+          ECS: ${{ steps.out.outputs.ecs }}
         run: |
           echo "## CloudPilot Deploy - ${{ inputs.project_name }}" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
@@ -298,8 +322,8 @@ print(json.dumps(result, indent=2))
           echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Stack | ${{ inputs.stack_type }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Region | ${{ inputs.aws_region }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| App URL | ${{ steps.out.outputs.alb }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| ECS Cluster | ${{ steps.out.outputs.ecs }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| App URL | $ALB |" >> $GITHUB_STEP_SUMMARY
+          echo "| ECS Cluster | $ECS |" >> $GITHUB_STEP_SUMMARY
 
       - name: Notify CloudPilot on success
         if: success() && inputs.callback_url != ''
@@ -313,4 +337,4 @@ print(json.dumps(result, indent=2))
         run: |
           curl -fsSL -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"failed\",\"error\":\"Terraform deployment failed - see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"failed\",\"error\":\"Terraform deployment failed\"}" || true
