@@ -1,16 +1,39 @@
-name: CloudPilot Test Minimal
+name: CloudPilot Test With Inputs
 
 on:
   workflow_dispatch:
     inputs:
       project_id:
-        description: test input
+        description: "CloudPilot project UUID"
         required: true
         type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+      stack_type:
+        description: "Infrastructure stack template"
+        required: true
+        type: choice
+        options:
+          - web-app
+          - api-backend
+          - static-site
+        default: web-app
+      enable_rds:
+        description: "Provision RDS (true/false)"
+        required: false
+        type: string
+        default: "false"
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Echo
-        run: echo "project=${{ inputs.project_id }}"
+        run: echo "env=${{ inputs.environment }} stack=${{ inputs.stack_type }}"
