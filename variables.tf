@@ -101,6 +101,15 @@ variable "container_image" {
   type        = string
 }
 
+variable "container_environment" {
+  description = "Extra environment variables injected into the ECS container (list of {name, value} objects)"
+  type = list(object({
+    name  = string
+    value = string
+  }))
+  default = []
+}
+
 variable "container_port" {
   description = "Port exposed by the container"
   type        = number

@@ -81,6 +81,15 @@ variable "db_endpoint" {
   default     = ""
 }
 
+variable "container_environment" {
+  description = "Extra environment variables injected into the ECS container (list of {name, value} objects)"
+  type = list(object({
+    name  = string
+    value = string
+  }))
+  default = []
+}
+
 variable "tags" {
   description = "Tags to apply to all resources"
   type        = map(string)

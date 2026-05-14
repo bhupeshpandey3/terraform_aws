@@ -107,6 +107,7 @@ module "ecs" {
   container_port        = var.container_port
   container_cpu         = var.container_cpu
   container_memory      = var.container_memory
+  container_environment = var.container_environment
   s3_bucket_arn         = try(module.s3[0].bucket_arn, "")
   db_endpoint           = try(module.rds[0].db_endpoint, "")
   health_check_path     = var.health_check_path

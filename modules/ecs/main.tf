@@ -160,10 +160,13 @@ resource "aws_ecs_task_definition" "main" {
       protocol      = "tcp"
     }]
 
-    environment = [
-      { name = "DB_ENDPOINT", value = var.db_endpoint },
-      { name = "ENVIRONMENT", value = split("-", var.name_prefix)[1] }
-    ]
+    environment = concat(
+      [
+        { name = "DB_ENDPOINT",  value = var.db_endpoint },
+        { name = "ENVIRONMENT",  value = split("-", var.name_prefix)[1] }
+      ],
+      var.container_environment
+    )
 
     logConfiguration = {
       logDriver = "awslogs"
