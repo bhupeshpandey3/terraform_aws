@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: ""
+      repo_github_token:
+        description: "GitHub PAT for cloning private application repositories (leave blank for public repos)"
+        required: false
+        type: string
+        default: ""
       environment:
         description: "Target environment"
         required: true
@@ -100,10 +105,16 @@ jobs:
         if: inputs.repo_url != ''
         env:
           REPO_URL: ${{ inputs.repo_url }}
+          REPO_TOKEN: ${{ inputs.repo_github_token }}
         run: |
-          # Strip any trailing .git
           CLEAN_URL="${REPO_URL%.git}"
-          git clone "$CLEAN_URL" app_source
+          if [ -n "$REPO_TOKEN" ]; then
+            # Inject token for private repo access
+            AUTH_URL=$(echo "$CLEAN_URL" | sed "s|https://|https://${REPO_TOKEN}@|")
+            git clone "$AUTH_URL" app_source
+          else
+            git clone "$CLEAN_URL" app_source
+          fi
           echo "APP_SOURCE_DIR=app_source" >> $GITHUB_ENV
           echo "BUILD_APP=true" >> $GITHUB_ENV
 
@@ -231,17 +242,34 @@ jobs:
           ECS_ENV_JSON:    ${{ env.ECS_ENV_JSON }}
         run: |
           case "${{ inputs.stack_type }}" in
-            web-app)       ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
-            api-backend)   ENABLE_S3=false; ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
-            static-site)   ENABLE_S3=true;  ENABLE_ALB=false; ENABLE_ECS=false; ENABLE_ECR=false ;;
-            microservices) ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
-            *)             ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
+            web-app)       ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false; HEALTH_PATH="/" ;;
+            api-backend)   ENABLE_S3=false; ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false; HEALTH_PATH="/health" ;;
+            static-site)   ENABLE_S3=true;  ENABLE_ALB=false; ENABLE_ECS=false; ENABLE_ECR=false; HEALTH_PATH="/" ;;
+            microservices) ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false; HEALTH_PATH="/health" ;;
+            *)             ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false; HEALTH_PATH="/" ;;
           esac
           # ECR is pre-created above if we built the image; Terraform manages it otherwise
           [[ "$BUILD_APP" == "true" ]] && ENABLE_ECR=false || ENABLE_ECR=true
 
           [[ "$ENVIRONMENT" == "prod" ]] && ENABLE_NAT=true  || ENABLE_NAT=false
           [[ "$ENVIRONMENT" == "prod" ]] && ECS_COUNT=2      || ECS_COUNT=1
+
+          # Generate RDS password when RDS is enabled (MySQL rejects empty passwords)
+          if [[ "${ENABLE_RDS:-false}" == "true" ]]; then
+            DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=')
+            # Store in AWS Secrets Manager so the user can retrieve it later
+            aws secretsmanager create-secret \
+              --name "cloudpilot/${{ inputs.project_id }}/db-password" \
+              --secret-string "$DB_PASSWORD" \
+              --region "$AWS_REGION" 2>/dev/null || \
+            aws secretsmanager put-secret-value \
+              --secret-id "cloudpilot/${{ inputs.project_id }}/db-password" \
+              --secret-string "$DB_PASSWORD" \
+              --region "$AWS_REGION"
+            echo "::add-mask::$DB_PASSWORD"
+          else
+            DB_PASSWORD=""
+          fi
 
           # Parse env json safely — default to empty array if not set
           ECS_ENV="${ECS_ENV_JSON:-[]}"
@@ -254,6 +282,8 @@ jobs:
             --arg  az2                  "$AZ2" \
             --arg  container_image      "$CONTAINER_IMAGE" \
             --arg  db_name              "$DB_NAME" \
+            --arg  db_password          "$DB_PASSWORD" \
+            --arg  health_check_path    "$HEALTH_PATH" \
             --arg  s3_bucket_name       "$S3_BUCKET" \
             --argjson enable_s3         $ENABLE_S3 \
             --argjson enable_alb        $ENABLE_ALB \
@@ -292,7 +322,7 @@ jobs:
               s3_bucket_name:           $s3_bucket_name,
               s3_versioning_enabled:    false,
               alb_internal:             false,
-              health_check_path:        "/",
+              health_check_path:        $health_check_path,
               certificate_arn:          "",
               cloudfront_origin_verify_secret: "cloudpilot-cf-secret",
               cloudfront_price_class:   "PriceClass_100",
@@ -302,7 +332,7 @@ jobs:
               db_instance_class:        "db.t3.micro",
               db_name:                  $db_name,
               db_username:              "admin",
-              db_password:              "",
+              db_password:              $db_password,
               db_allocated_storage:     20,
               db_multi_az:              false,
               db_deletion_protection:   false,
@@ -318,8 +348,7 @@ jobs:
             }' > cloudpilot.auto.tfvars.json
 
           echo "--- Generated tfvars ---"
-          # Mask env vars before printing
-          jq 'del(.container_environment)' cloudpilot.auto.tfvars.json
+          jq 'del(.container_environment, .db_password)' cloudpilot.auto.tfvars.json
 
       # ── Terraform ─────────────────────────────────────────────────────────
       - name: Terraform Init
