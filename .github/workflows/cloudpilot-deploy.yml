@@ -11,35 +11,28 @@ on:
         description: "Project slug (e.g. my-app)"
         required: true
         type: string
+      repo_url:
+        description: "GitHub URL of the application to deploy (e.g. https://github.com/org/app)"
+        required: false
+        type: string
+        default: ""
       environment:
         description: "Target environment"
         required: true
         type: choice
-        options:
-          - dev
-          - staging
-          - prod
+        options: [dev, staging, prod]
         default: dev
       stack_type:
         description: "Infrastructure stack template"
         required: true
         type: choice
-        options:
-          - web-app
-          - api-backend
-          - static-site
-          - microservices
+        options: [web-app, api-backend, static-site, microservices]
         default: web-app
       aws_region:
         description: "AWS region"
         required: true
         type: string
         default: us-east-1
-      container_image:
-        description: "Container image URI"
-        required: false
-        type: string
-        default: "public.ecr.aws/docker/library/nginx:stable-alpine"
       container_port:
         description: "Container port number"
         required: false
@@ -55,8 +48,8 @@ on:
         required: false
         type: string
         default: "false"
-      db_password:
-        description: "Database master password (required only if enable_rds=true)"
+      app_env_vars:
+        description: "App environment variables as KEY=VALUE lines (newline-separated)"
         required: false
         type: string
         default: ""
@@ -74,7 +67,7 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout
+      - name: Checkout Terraform repo
         uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
@@ -99,56 +92,159 @@ jobs:
             terraform-providers-${{ inputs.aws_region }}-
             terraform-providers-
 
+      # ── App build (optional) ───────────────────────────────────────────────
+      # If repo_url is provided, clone the app, build a Docker image, and push
+      # to ECR. If no repo_url is set, skip silently and use the nginx fallback.
+
+      - name: Clone application repository
+        if: inputs.repo_url != ''
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+        run: |
+          # Strip any trailing .git
+          CLEAN_URL="${REPO_URL%.git}"
+          git clone "$CLEAN_URL" app_source
+          echo "APP_SOURCE_DIR=app_source" >> $GITHUB_ENV
+          echo "BUILD_APP=true" >> $GITHUB_ENV
+
+      - name: Detect or generate Dockerfile
+        if: env.BUILD_APP == 'true'
+        working-directory: app_source
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "DOCKERFILE_PATH=Dockerfile" >> $GITHUB_ENV
+            echo "DOCKERFILE_CONTEXT=." >> $GITHUB_ENV
+            echo "Found Dockerfile at root"
+          elif [ -f backend/Dockerfile ]; then
+            echo "DOCKERFILE_PATH=backend/Dockerfile" >> $GITHUB_ENV
+            echo "DOCKERFILE_CONTEXT=backend" >> $GITHUB_ENV
+            echo "Found Dockerfile at backend/"
+          elif [ -f frontend/Dockerfile ]; then
+            echo "DOCKERFILE_PATH=frontend/Dockerfile" >> $GITHUB_ENV
+            echo "DOCKERFILE_CONTEXT=frontend" >> $GITHUB_ENV
+            echo "Found Dockerfile at frontend/"
+          else
+            echo "No Dockerfile found — auto-generating one"
+            bash "$GITHUB_WORKSPACE/.github/scripts/generate-dockerfile.sh"
+          fi
+
+      - name: Create ECR repository if it does not exist
+        if: env.BUILD_APP == 'true'
+        env:
+          PROJECT_SLUG: ${{ inputs.project_name }}
+          AWS_REGION:   ${{ inputs.aws_region }}
+        run: |
+          ECR_REPO="${PROJECT_SLUG}-app"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" 2>/dev/null || \
+            aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION"
+          echo "ECR_URI=${ECR_URI}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        if: env.BUILD_APP == 'true'
+        working-directory: app_source
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin "$ECR_URI"
+
+          # Write app env vars as Docker build-args for frontend build-time vars
+          BUILD_ARGS=""
+          if [ -n "${{ inputs.app_env_vars }}" ]; then
+            while IFS='=' read -r KEY VAL; do
+              [[ -z "$KEY" || "$KEY" == \#* ]] && continue
+              BUILD_ARGS="$BUILD_ARGS --build-arg ${KEY}=${VAL}"
+            done <<< "${{ inputs.app_env_vars }}"
+          fi
+
+          docker build $BUILD_ARGS \
+            -f "$DOCKERFILE_PATH" \
+            -t "${ECR_URI}:${IMAGE_TAG}" \
+            -t "${ECR_URI}:latest" \
+            "$DOCKERFILE_CONTEXT"
+
+          docker push "${ECR_URI}:${IMAGE_TAG}"
+          docker push "${ECR_URI}:latest"
+          echo "CONTAINER_IMAGE=${ECR_URI}:${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "Built and pushed: ${ECR_URI}:${IMAGE_TAG}"
+
+      - name: Set fallback image (no repo_url provided)
+        if: env.BUILD_APP != 'true'
+        run: |
+          echo "CONTAINER_IMAGE=public.ecr.aws/docker/library/nginx:stable-alpine" >> $GITHUB_ENV
+          echo "No app repo provided — using nginx placeholder image"
+
+      # ── Env vars → ECS task env JSON ──────────────────────────────────────
+      - name: Build ECS environment JSON
+        id: ecs_env
+        run: |
+          ENV_JSON="[]"
+          if [ -n "${{ inputs.app_env_vars }}" ]; then
+            ENV_JSON=$(while IFS='=' read -r KEY VAL; do
+              [[ -z "$KEY" || "$KEY" == \#* ]] && continue
+              printf '{"name":"%s","value":"%s"}\n' "$KEY" "${VAL//\"/\\\"}"
+            done <<< "${{ inputs.app_env_vars }}" | jq -sc '.')
+          fi
+          echo "env_json=$ENV_JSON" >> $GITHUB_OUTPUT
+          echo "ECS_ENV_JSON=$ENV_JSON" >> $GITHUB_ENV
+
+      # ── Networking / naming ────────────────────────────────────────────────
       - name: Resolve networking and naming
         id: net
         env:
-          AWS_REGION: ${{ inputs.aws_region }}
-          PROJECT_ID: ${{ inputs.project_id }}
+          AWS_REGION:   ${{ inputs.aws_region }}
+          PROJECT_ID:   ${{ inputs.project_id }}
           PROJECT_NAME: ${{ inputs.project_name }}
         run: |
           AZS=$(aws ec2 describe-availability-zones \
             --region "$AWS_REGION" \
             --query 'AvailabilityZones[?State==`available`].ZoneName' \
             --output json | jq -c '.[0:2]')
-          AZ1=$(echo "$AZS" | jq -r '.[0]')
-          AZ2=$(echo "$AZS" | jq -r '.[1]')
-          echo "az1=$AZ1" >> $GITHUB_OUTPUT
-          echo "az2=$AZ2" >> $GITHUB_OUTPUT
+          echo "az1=$(echo $AZS | jq -r '.[0]')" >> $GITHUB_OUTPUT
+          echo "az2=$(echo $AZS | jq -r '.[1]')" >> $GITHUB_OUTPUT
 
           S3_SUFFIX=$(echo "$PROJECT_ID" | tr -d '-' | cut -c1-8)
-          RAW="${PROJECT_NAME}-${S3_SUFFIX}"
-          S3_NAME=$(echo "$RAW" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-*//;s/-*$//' | cut -c1-63)
+          S3_NAME=$(echo "${PROJECT_NAME}-${S3_SUFFIX}" | tr '[:upper:]' '[:lower:]' | \
+            tr -cs 'a-z0-9-' '-' | sed 's/^-*//;s/-*$//' | cut -c1-63)
           echo "s3_bucket=$S3_NAME" >> $GITHUB_OUTPUT
 
           DB_NAME=$(echo "$PROJECT_NAME" | tr '-' '_' | tr -cs 'a-z0-9_' '_' | cut -c1-63)
           echo "db_name=${DB_NAME:-appdb}" >> $GITHUB_OUTPUT
 
+      # ── Terraform Variables ────────────────────────────────────────────────
       - name: Generate Terraform Variables
-        id: tfvars
         env:
           ENVIRONMENT:     ${{ inputs.environment }}
           PROJECT_NAME:    ${{ inputs.project_name }}
           AWS_REGION:      ${{ inputs.aws_region }}
-          CONTAINER_IMAGE: ${{ inputs.container_image }}
+          CONTAINER_IMAGE: ${{ env.CONTAINER_IMAGE }}
           CONTAINER_PORT:  ${{ inputs.container_port }}
           ENABLE_RDS:      ${{ inputs.enable_rds }}
           ENABLE_CF:       ${{ inputs.enable_cloudfront }}
-          DB_PASSWORD:     ${{ inputs.db_password }}
           S3_BUCKET:       ${{ steps.net.outputs.s3_bucket }}
           DB_NAME:         ${{ steps.net.outputs.db_name }}
           AZ1:             ${{ steps.net.outputs.az1 }}
           AZ2:             ${{ steps.net.outputs.az2 }}
+          ECS_ENV_JSON:    ${{ env.ECS_ENV_JSON }}
         run: |
           case "${{ inputs.stack_type }}" in
-            web-app)       ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=true ;;
-            api-backend)   ENABLE_S3=false; ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=true ;;
+            web-app)       ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
+            api-backend)   ENABLE_S3=false; ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
             static-site)   ENABLE_S3=true;  ENABLE_ALB=false; ENABLE_ECS=false; ENABLE_ECR=false ;;
-            microservices) ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=true ;;
-            *)             ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=true ;;
+            microservices) ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
+            *)             ENABLE_S3=true;  ENABLE_ALB=true;  ENABLE_ECS=true;  ENABLE_ECR=false ;;
           esac
+          # ECR is pre-created above if we built the image; Terraform manages it otherwise
+          [[ "$BUILD_APP" == "true" ]] && ENABLE_ECR=false || ENABLE_ECR=true
 
-          [[ "$ENVIRONMENT" == "prod" ]] && ENABLE_NAT=true || ENABLE_NAT=false
-          [[ "$ENVIRONMENT" == "prod" ]] && ECS_COUNT=2 || ECS_COUNT=1
+          [[ "$ENVIRONMENT" == "prod" ]] && ENABLE_NAT=true  || ENABLE_NAT=false
+          [[ "$ENVIRONMENT" == "prod" ]] && ECS_COUNT=2      || ECS_COUNT=1
+
+          # Parse env json safely — default to empty array if not set
+          ECS_ENV="${ECS_ENV_JSON:-[]}"
 
           jq -n \
             --arg  environment          "$ENVIRONMENT" \
@@ -158,7 +254,6 @@ jobs:
             --arg  az2                  "$AZ2" \
             --arg  container_image      "$CONTAINER_IMAGE" \
             --arg  db_name              "$DB_NAME" \
-            --arg  db_password          "$DB_PASSWORD" \
             --arg  s3_bucket_name       "$S3_BUCKET" \
             --argjson enable_s3         $ENABLE_S3 \
             --argjson enable_alb        $ENABLE_ALB \
@@ -169,60 +264,64 @@ jobs:
             --argjson enable_cf         ${ENABLE_CF:-false} \
             --argjson container_port    ${CONTAINER_PORT:-80} \
             --argjson ecs_count         $ECS_COUNT \
+            --argjson container_environment "$ECS_ENV" \
             '{
-              environment:          $environment,
-              project_name:         $project_name,
-              aws_region:           $aws_region,
-              vpc_cidr:             "10.0.0.0/16",
-              availability_zones:   [$az1, $az2],
-              public_subnet_cidrs:  ["10.0.1.0/24", "10.0.2.0/24"],
-              private_subnet_cidrs: ["10.0.10.0/24", "10.0.11.0/24"],
-              enable_s3:            $enable_s3,
-              enable_alb:           $enable_alb,
-              enable_ecs:           $enable_ecs,
-              enable_ecr:           $enable_ecr,
-              enable_rds:           $enable_rds,
-              enable_nat_gateway:   $enable_nat,
-              enable_scheduler:     false,
-              enable_cloudfront:    $enable_cf,
-              enable_eks:           false,
-              container_image:      $container_image,
-              container_port:       $container_port,
-              container_cpu:        256,
-              container_memory:     512,
-              ecs_launch_type:      "FARGATE",
-              ecs_desired_count:    $ecs_count,
-              s3_bucket_name:       $s3_bucket_name,
-              s3_versioning_enabled: false,
-              alb_internal:         false,
-              health_check_path:    "/",
-              certificate_arn:      "",
-              cloudfront_origin_verify_secret: "cloudpilot-change-me",
-              cloudfront_price_class: "PriceClass_100",
+              environment:              $environment,
+              project_name:             $project_name,
+              aws_region:               $aws_region,
+              vpc_cidr:                 "10.0.0.0/16",
+              availability_zones:       [$az1, $az2],
+              public_subnet_cidrs:      ["10.0.1.0/24","10.0.2.0/24"],
+              private_subnet_cidrs:     ["10.0.10.0/24","10.0.11.0/24"],
+              enable_s3:                $enable_s3,
+              enable_alb:               $enable_alb,
+              enable_ecs:               $enable_ecs,
+              enable_ecr:               $enable_ecr,
+              enable_rds:               $enable_rds,
+              enable_nat_gateway:       $enable_nat,
+              enable_scheduler:         false,
+              enable_cloudfront:        $enable_cf,
+              enable_eks:               false,
+              container_image:          $container_image,
+              container_port:           $container_port,
+              container_cpu:            256,
+              container_memory:         512,
+              container_environment:    $container_environment,
+              ecs_launch_type:          "FARGATE",
+              ecs_desired_count:        $ecs_count,
+              s3_bucket_name:           $s3_bucket_name,
+              s3_versioning_enabled:    false,
+              alb_internal:             false,
+              health_check_path:        "/",
+              certificate_arn:          "",
+              cloudfront_origin_verify_secret: "cloudpilot-cf-secret",
+              cloudfront_price_class:   "PriceClass_100",
               cloudfront_acm_certificate_arn: "",
-              db_engine:            "mysql",
-              db_engine_version:    "8.0",
-              db_instance_class:    "db.t3.micro",
-              db_name:              $db_name,
-              db_username:          "admin",
-              db_password:          $db_password,
-              db_allocated_storage: 20,
-              db_multi_az:          false,
-              db_deletion_protection: false,
+              db_engine:                "mysql",
+              db_engine_version:        "8.0",
+              db_instance_class:        "db.t3.micro",
+              db_name:                  $db_name,
+              db_username:              "admin",
+              db_password:              "",
+              db_allocated_storage:     20,
+              db_multi_az:              false,
+              db_deletion_protection:   false,
               db_backup_retention_period: 7,
-              ecr_repositories:     ["app"],
-              ec2_instance_type:    "t3.medium",
-              ec2_desired_capacity: 1,
-              ec2_min_size:         1,
-              ec2_max_size:         2,
-              schedule_stop_cron:   "cron(0 20 * * ? *)",
-              schedule_start_cron:  "cron(0 8 * * ? *)",
-              schedule_desired_count: 1
+              ecr_repositories:         ["app"],
+              ec2_instance_type:        "t3.medium",
+              ec2_desired_capacity:     1,
+              ec2_min_size:             1,
+              ec2_max_size:             2,
+              schedule_stop_cron:       "cron(0 20 * * ? *)",
+              schedule_start_cron:      "cron(0 8 * * ? *)",
+              schedule_desired_count:   1
             }' > cloudpilot.auto.tfvars.json
 
           echo "--- Generated tfvars ---"
-          cat cloudpilot.auto.tfvars.json
+          # Mask env vars before printing
+          jq 'del(.container_environment)' cloudpilot.auto.tfvars.json
 
+      # ── Terraform ─────────────────────────────────────────────────────────
       - name: Terraform Init
         env:
           TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
@@ -251,6 +350,7 @@ jobs:
         run: |
           terraform apply -parallelism=20 -input=false -auto-approve tfplan 2>&1 | tee apply.log
 
+      # ── Capture outputs ────────────────────────────────────────────────────
       - name: Capture Terraform Outputs
         id: out
         run: |
@@ -268,7 +368,7 @@ jobs:
           echo "cf=$CFD"  >> $GITHUB_OUTPUT
           echo "vpc=$VPC" >> $GITHUB_OUTPUT
 
-      - name: Build and upload outputs artifact
+      - name: Build outputs artifact
         env:
           PROJECT_ID:  ${{ inputs.project_id }}
           ENVIRONMENT: ${{ inputs.environment }}
@@ -287,33 +387,35 @@ jobs:
           [[ -z "$APP_URL" && -n "$ALB_DNS" ]] && APP_URL="http://${ALB_DNS}"
 
           jq -n \
-            --arg project_id       "$PROJECT_ID" \
-            --arg workflow_run_id  "$RUN_ID" \
-            --arg environment      "$ENVIRONMENT" \
-            --arg aws_region       "$AWS_REGION" \
-            --arg stack_type       "$STACK_TYPE" \
-            --arg app_url          "$APP_URL" \
-            --arg alb_dns_name     "$ALB_DNS" \
-            --arg ecs_cluster_name "$ECS_CLUSTER" \
-            --arg ecs_service_name "$ECS_SVC" \
-            --arg s3_bucket_name   "$S3_BUCKET" \
+            --arg project_id        "$PROJECT_ID" \
+            --arg workflow_run_id   "$RUN_ID" \
+            --arg environment       "$ENVIRONMENT" \
+            --arg aws_region        "$AWS_REGION" \
+            --arg stack_type        "$STACK_TYPE" \
+            --arg app_url           "$APP_URL" \
+            --arg alb_dns_name      "$ALB_DNS" \
+            --arg ecs_cluster_name  "$ECS_CLUSTER" \
+            --arg ecs_service_name  "$ECS_SVC" \
+            --arg s3_bucket_name    "$S3_BUCKET" \
             --arg cloudfront_domain "$CF_DOMAIN" \
-            --arg vpc_id           "$VPC_ID" \
+            --arg vpc_id            "$VPC_ID" \
+            --arg container_image   "${CONTAINER_IMAGE:-}" \
             --slurpfile tf_out raw_outputs.json \
             '{
-              project_id:       $project_id,
-              workflow_run_id:  $workflow_run_id,
-              status:           "deployed",
-              environment:      $environment,
-              aws_region:       $aws_region,
-              stack_type:       $stack_type,
-              app_url:          $app_url,
-              alb_dns_name:     $alb_dns_name,
-              ecs_cluster_name: $ecs_cluster_name,
-              ecs_service_name: $ecs_service_name,
-              s3_bucket_name:   $s3_bucket_name,
+              project_id:        $project_id,
+              workflow_run_id:   $workflow_run_id,
+              status:            "deployed",
+              environment:       $environment,
+              aws_region:        $aws_region,
+              stack_type:        $stack_type,
+              app_url:           $app_url,
+              alb_dns_name:      $alb_dns_name,
+              ecs_cluster_name:  $ecs_cluster_name,
+              ecs_service_name:  $ecs_service_name,
+              s3_bucket_name:    $s3_bucket_name,
               cloudfront_domain: $cloudfront_domain,
-              vpc_id:           $vpc_id,
+              vpc_id:            $vpc_id,
+              container_image:   $container_image,
               terraform_outputs: $tf_out[0]
             }' > cloudpilot-outputs.json
 
@@ -330,18 +432,16 @@ jobs:
 
       - name: Write Job Summary
         if: always()
-        env:
-          ALB: ${{ steps.out.outputs.alb }}
-          ECS: ${{ steps.out.outputs.ecs }}
         run: |
-          echo "## CloudPilot Deploy - ${{ inputs.project_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "## CloudPilot Deploy — ${{ inputs.project_name }}" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Stack | ${{ inputs.stack_type }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Region | ${{ inputs.aws_region }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| App URL | $ALB |" >> $GITHUB_STEP_SUMMARY
-          echo "| ECS Cluster | $ECS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | ${CONTAINER_IMAGE:-nginx fallback} |" >> $GITHUB_STEP_SUMMARY
+          echo "| App URL | ${{ steps.out.outputs.alb }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ECS Cluster | ${{ steps.out.outputs.ecs }} |" >> $GITHUB_STEP_SUMMARY
 
       - name: Notify CloudPilot on success
         if: success() && inputs.callback_url != ''
@@ -355,4 +455,4 @@ jobs:
         run: |
           curl -fsSL -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
-            -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"failed\",\"error\":\"Terraform deployment failed\"}" || true
+            -d "{\"project_id\":\"${{ inputs.project_id }}\",\"workflow_run_id\":\"${{ github.run_id }}\",\"status\":\"failed\"}" || true
