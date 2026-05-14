@@ -90,6 +90,15 @@ jobs:
           terraform_version: "~1.10"
           terraform_wrapper: false
 
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-providers-${{ inputs.aws_region }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            terraform-providers-${{ inputs.aws_region }}-
+            terraform-providers-
+
       - name: Resolve networking and naming
         id: net
         env:
@@ -215,15 +224,21 @@ jobs:
           cat cloudpilot.auto.tfvars.json
 
       - name: Terraform Init
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
+          mkdir -p ~/.terraform.d/plugin-cache
           terraform init -reconfigure \
             -backend-config="key=cloudpilot/${{ inputs.project_id }}/terraform.tfstate" \
             -input=false -no-color
 
       - name: Terraform Plan
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
           terraform plan \
             -var-file="cloudpilot.auto.tfvars.json" \
+            -parallelism=20 \
             -input=false -no-color -out=tfplan 2>&1 | tee plan.log
           echo "### Terraform Plan" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -231,8 +246,10 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Terraform Apply
+        env:
+          TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
-          terraform apply -input=false -auto-approve tfplan 2>&1 | tee apply.log
+          terraform apply -parallelism=20 -input=false -auto-approve tfplan 2>&1 | tee apply.log
 
       - name: Capture Terraform Outputs
         id: out
