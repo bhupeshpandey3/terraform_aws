@@ -23,8 +23,12 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  destroy:
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENV:   ${{ github.event.inputs.environment }}
+      STACK: ${{ github.event.inputs.stack }}
     steps:
       - name: Confirm destroy intent
         run: |
@@ -32,16 +36,8 @@ jobs:
             echo "::error::Confirmation text must be exactly 'destroy'. Got: '${{ github.event.inputs.confirm }}'"
             exit 1
           fi
-          echo "Confirmation accepted. Proceeding with destroy of ${{ github.event.inputs.environment }}."
+          echo "Confirmation accepted. Proceeding with destroy of ${{ env.ENV }}."
 
-  destroy:
-    needs: validate
-    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
-    environment: ${{ github.event.inputs.environment }}
-    env:
-      ENV:   ${{ github.event.inputs.environment }}
-      STACK: ${{ github.event.inputs.stack }}
-    steps:
       - uses: actions/checkout@v4
 
       - uses: aws-actions/configure-aws-credentials@v4

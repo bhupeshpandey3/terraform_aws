@@ -31,8 +31,11 @@ env:
   TF_BUCKET: myapp-tfstate-685197708357
 
 jobs:
-  guard:
+  cleanup:
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENV: ${{ github.event.inputs.environment }}
     steps:
       - name: Validate confirmation
         run: |
@@ -43,13 +46,6 @@ jobs:
           fi
           echo "Confirmation accepted. Will nuke ${{ github.event.inputs.environment }}."
 
-  cleanup:
-    needs: guard
-    runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
-    environment: ${{ github.event.inputs.environment }}
-    env:
-      ENV: ${{ github.event.inputs.environment }}
-    steps:
       - uses: actions/checkout@v4
 
       - uses: aws-actions/configure-aws-credentials@v4
