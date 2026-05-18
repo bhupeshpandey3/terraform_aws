@@ -68,6 +68,26 @@ on:
         required: false
         type: string
         default: "false"
+      db_engine:
+        description: "Database engine for RDS (mysql or postgres)"
+        required: false
+        type: string
+        default: "mysql"
+      container_cpu:
+        description: "ECS task CPU units (256/512/1024)"
+        required: false
+        type: string
+        default: "256"
+      container_memory:
+        description: "ECS task memory in MB (512/1024/2048)"
+        required: false
+        type: string
+        default: "512"
+      health_check_grace_period:
+        description: "ECS service health check grace period in seconds"
+        required: false
+        type: string
+        default: "120"
 
 jobs:
   deploy:
@@ -77,6 +97,12 @@ jobs:
       contents: read
 
     steps:
+      - name: Mask sensitive inputs
+        run: |
+          if [ -n "${{ inputs.repo_github_token }}" ]; then
+            echo "::add-mask::${{ inputs.repo_github_token }}"
+          fi
+
       - name: Checkout Terraform repo
         uses: actions/checkout@v4
 
@@ -112,13 +138,13 @@ jobs:
           REPO_URL: ${{ inputs.repo_url }}
           REPO_TOKEN: ${{ inputs.repo_github_token }}
         run: |
+          [ -d app_source ] && rm -rf app_source
           CLEAN_URL="${REPO_URL%.git}"
           if [ -n "$REPO_TOKEN" ]; then
-            # Inject token for private repo access
             AUTH_URL=$(echo "$CLEAN_URL" | sed "s|https://|https://${REPO_TOKEN}@|")
-            git clone "$AUTH_URL" app_source
+            git clone --depth 1 "$AUTH_URL" app_source
           else
-            git clone "$CLEAN_URL" app_source
+            git clone --depth 1 "$CLEAN_URL" app_source
           fi
           echo "APP_SOURCE_DIR=app_source" >> $GITHUB_ENV
           echo "BUILD_APP=true" >> $GITHUB_ENV
@@ -159,6 +185,25 @@ jobs:
             aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION"
           echo "ECR_URI=${ECR_URI}" >> $GITHUB_ENV
           echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+
+      - name: Set ECR lifecycle policy (keep last 5 images)
+        if: env.BUILD_APP == 'true'
+        env:
+          PROJECT_SLUG: ${{ inputs.project_name }}
+          AWS_REGION:   ${{ inputs.aws_region }}
+        run: |
+          ECR_REPO="${PROJECT_SLUG}-app"
+          aws ecr put-lifecycle-policy \
+            --repository-name "$ECR_REPO" \
+            --region "$AWS_REGION" \
+            --lifecycle-policy-text '{
+              "rules":[{
+                "rulePriority":1,
+                "description":"Keep last 5 images",
+                "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},
+                "action":{"type":"expire"}
+              }]
+            }' || true
 
       - name: Build and push Docker image
         if: env.BUILD_APP == 'true'
@@ -261,18 +306,23 @@ jobs:
           [[ "$ENVIRONMENT" == "prod" ]] && ENABLE_NAT=true  || ENABLE_NAT=false
           [[ "$ENVIRONMENT" == "prod" ]] && ECS_COUNT=2      || ECS_COUNT=1
 
-          # Generate RDS password when RDS is enabled (MySQL rejects empty passwords)
+          # Generate RDS password only on first deploy; reuse on redeploys
           if [[ "${ENABLE_RDS:-false}" == "true" ]]; then
-            DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=')
-            # Store in AWS Secrets Manager so the user can retrieve it later
-            aws secretsmanager create-secret \
-              --name "cloudpilot/${{ inputs.project_id }}/db-password" \
-              --secret-string "$DB_PASSWORD" \
-              --region "$AWS_REGION" 2>/dev/null || \
-            aws secretsmanager put-secret-value \
+            EXISTING_PW=$(aws secretsmanager get-secret-value \
               --secret-id "cloudpilot/${{ inputs.project_id }}/db-password" \
-              --secret-string "$DB_PASSWORD" \
-              --region "$AWS_REGION"
+              --region "$AWS_REGION" \
+              --query SecretString --output text 2>/dev/null || echo "")
+            if [ -n "$EXISTING_PW" ]; then
+              DB_PASSWORD="$EXISTING_PW"
+              echo "Reusing existing DB password from Secrets Manager"
+            else
+              DB_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=')
+              aws secretsmanager create-secret \
+                --name "cloudpilot/${{ inputs.project_id }}/db-password" \
+                --secret-string "$DB_PASSWORD" \
+                --region "$AWS_REGION"
+              echo "Generated and stored new DB password"
+            fi
             echo "::add-mask::$DB_PASSWORD"
           else
             DB_PASSWORD=""
@@ -280,6 +330,12 @@ jobs:
 
           # Parse env json safely — default to empty array if not set
           ECS_ENV="${ECS_ENV_JSON:-[]}"
+
+          # Derive db engine version from engine type
+          case "${{ inputs.db_engine }}" in
+            postgres) DB_ENGINE_VERSION="15.4" ;;
+            *)        DB_ENGINE_VERSION="8.0"  ;;
+          esac
 
           jq -n \
             --arg  environment          "$ENVIRONMENT" \
@@ -301,7 +357,12 @@ jobs:
             --argjson enable_cf         ${ENABLE_CF:-false} \
             --argjson container_port    ${CONTAINER_PORT:-80} \
             --argjson ecs_count         $ECS_COUNT \
-            --argjson container_environment "$ECS_ENV" \
+            --argjson container_environment    "$ECS_ENV" \
+            --argjson container_cpu            ${{ inputs.container_cpu }} \
+            --argjson container_memory         ${{ inputs.container_memory }} \
+            --arg     db_engine                "${{ inputs.db_engine }}" \
+            --arg     db_engine_version        "$DB_ENGINE_VERSION" \
+            --argjson health_check_grace_period ${{ inputs.health_check_grace_period }} \
             '{
               environment:              $environment,
               project_name:             $project_name,
@@ -321,11 +382,12 @@ jobs:
               enable_eks:               false,
               container_image:          $container_image,
               container_port:           $container_port,
-              container_cpu:            256,
-              container_memory:         512,
+              container_cpu:            $container_cpu,
+              container_memory:         $container_memory,
               container_environment:    $container_environment,
               ecs_launch_type:          "FARGATE",
               ecs_desired_count:        $ecs_count,
+              health_check_grace_period: $health_check_grace_period,
               s3_bucket_name:           $s3_bucket_name,
               s3_versioning_enabled:    false,
               alb_internal:             false,
@@ -334,8 +396,8 @@ jobs:
               cloudfront_origin_verify_secret: "cloudpilot-cf-secret",
               cloudfront_price_class:   "PriceClass_100",
               cloudfront_acm_certificate_arn: "",
-              db_engine:                "mysql",
-              db_engine_version:        "8.0",
+              db_engine:                $db_engine,
+              db_engine_version:        $db_engine_version,
               db_instance_class:        "db.t3.micro",
               db_name:                  $db_name,
               db_username:              "admin",
@@ -451,12 +513,14 @@ jobs:
           S3B=$(terraform output -raw s3_bucket_name         2>/dev/null || echo "")
           CFD=$(terraform output -raw cloudfront_domain_name 2>/dev/null || echo "")
           VPC=$(terraform output -raw vpc_id                 2>/dev/null || echo "")
+          RDS=$(terraform output -raw rds_endpoint           2>/dev/null || echo "")
           echo "alb=$ALB" >> $GITHUB_OUTPUT
           echo "ecs=$ECS" >> $GITHUB_OUTPUT
           echo "svc=$SVC" >> $GITHUB_OUTPUT
           echo "s3=$S3B"  >> $GITHUB_OUTPUT
           echo "cf=$CFD"  >> $GITHUB_OUTPUT
           echo "vpc=$VPC" >> $GITHUB_OUTPUT
+          echo "rds=$RDS" >> $GITHUB_OUTPUT
 
       - name: Build outputs artifact
         env:
@@ -469,8 +533,9 @@ jobs:
           ECS_CLUSTER: ${{ steps.out.outputs.ecs }}
           ECS_SVC:     ${{ steps.out.outputs.svc }}
           S3_BUCKET:   ${{ steps.out.outputs.s3 }}
-          VPC_ID:      ${{ steps.out.outputs.vpc }}
-          RUN_ID:      ${{ github.run_id }}
+          VPC_ID:       ${{ steps.out.outputs.vpc }}
+          RDS_ENDPOINT: ${{ steps.out.outputs.rds }}
+          RUN_ID:       ${{ github.run_id }}
         run: |
           APP_URL=""
           [[ -n "$CF_DOMAIN" ]] && APP_URL="https://${CF_DOMAIN}"
@@ -489,6 +554,7 @@ jobs:
             --arg s3_bucket_name    "$S3_BUCKET" \
             --arg cloudfront_domain "$CF_DOMAIN" \
             --arg vpc_id            "$VPC_ID" \
+            --arg rds_endpoint      "${RDS_ENDPOINT:-}" \
             --arg container_image   "${CONTAINER_IMAGE:-}" \
             --slurpfile tf_out raw_outputs.json \
             '{
@@ -505,6 +571,7 @@ jobs:
               s3_bucket_name:    $s3_bucket_name,
               cloudfront_domain: $cloudfront_domain,
               vpc_id:            $vpc_id,
+              rds_endpoint:      $rds_endpoint,
               container_image:   $container_image,
               terraform_outputs: $tf_out[0]
             }' > cloudpilot-outputs.json
