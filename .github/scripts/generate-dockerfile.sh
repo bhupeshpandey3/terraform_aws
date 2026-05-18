@@ -1,10 +1,12 @@
 #!/bin/bash
 # Auto-generates a Dockerfile when the app repo has none.
 # Called from cloudpilot-deploy.yml inside the app_source directory.
+# CONTAINER_PORT is passed from the workflow (defaults to 80 if unset).
 set -euo pipefail
 
 DOCKERFILE_CONTEXT="."
 DOCKERFILE_PATH="Dockerfile"
+APP_PORT="${CONTAINER_PORT:-80}"
 
 if [ -f "package.json" ]; then
   START_CMD=$(node -e "try{const p=require('./package.json');console.log(p.scripts&&p.scripts.start?'npm start':'node index.js')}catch(e){console.log('npm start')}" 2>/dev/null || echo "npm start")
@@ -19,12 +21,12 @@ COPY package*.json ./
 RUN npm install --omit=dev
 COPY . .
 ${BUILD_CMD}
-EXPOSE 3000
+EXPOSE ${APP_PORT}
 CMD ["sh","-c","${START_CMD}"]
 DEOF
   echo "DOCKERFILE_PATH=Dockerfile" >> "$GITHUB_ENV"
   echo "DOCKERFILE_CONTEXT=." >> "$GITHUB_ENV"
-  echo "Generated Node.js Dockerfile"
+  echo "Generated Node.js Dockerfile (port ${APP_PORT})"
 
 elif [ -f "pom.xml" ]; then
   cat > Dockerfile <<DEOF
@@ -38,12 +40,12 @@ RUN mvn package -DskipTests -q
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
-EXPOSE 8080
+EXPOSE ${APP_PORT}
 ENTRYPOINT ["java","-jar","app.jar"]
 DEOF
   echo "DOCKERFILE_PATH=Dockerfile" >> "$GITHUB_ENV"
   echo "DOCKERFILE_CONTEXT=." >> "$GITHUB_ENV"
-  echo "Generated Maven/Java Dockerfile"
+  echo "Generated Maven/Java Dockerfile (port ${APP_PORT})"
 
 elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
   cat > Dockerfile <<DEOF
@@ -55,12 +57,12 @@ RUN gradle bootJar --no-daemon -q
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 COPY --from=build /app/build/libs/*.jar app.jar
-EXPOSE 8080
+EXPOSE ${APP_PORT}
 ENTRYPOINT ["java","-jar","app.jar"]
 DEOF
   echo "DOCKERFILE_PATH=Dockerfile" >> "$GITHUB_ENV"
   echo "DOCKERFILE_CONTEXT=." >> "$GITHUB_ENV"
-  echo "Generated Gradle/Java Dockerfile"
+  echo "Generated Gradle/Java Dockerfile (port ${APP_PORT})"
 
 elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
   DEPS_CMD="pip install -r requirements.txt"
@@ -70,15 +72,14 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY . .
 RUN ${DEPS_CMD}
-EXPOSE 8000
+EXPOSE ${APP_PORT}
 CMD ["python", "app.py"]
 DEOF
   echo "DOCKERFILE_PATH=Dockerfile" >> "$GITHUB_ENV"
   echo "DOCKERFILE_CONTEXT=." >> "$GITHUB_ENV"
-  echo "Generated Python Dockerfile"
+  echo "Generated Python Dockerfile (port ${APP_PORT})"
 
 elif [ -f "go.mod" ]; then
-  APP_NAME=$(head -1 go.mod | awk '{print $2}' | xargs basename)
   cat > Dockerfile <<DEOF
 FROM golang:1.22-alpine AS build
 WORKDIR /app
@@ -90,12 +91,12 @@ RUN go build -o /app/server .
 FROM alpine:3.19
 WORKDIR /app
 COPY --from=build /app/server .
-EXPOSE 8080
+EXPOSE ${APP_PORT}
 CMD ["/app/server"]
 DEOF
   echo "DOCKERFILE_PATH=Dockerfile" >> "$GITHUB_ENV"
   echo "DOCKERFILE_CONTEXT=." >> "$GITHUB_ENV"
-  echo "Generated Go Dockerfile"
+  echo "Generated Go Dockerfile (port ${APP_PORT})"
 
 else
   echo "Could not detect language — using nginx fallback"

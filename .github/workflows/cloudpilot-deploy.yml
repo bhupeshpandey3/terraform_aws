@@ -63,6 +63,11 @@ on:
         required: false
         type: string
         default: ""
+      is_monorepo:
+        description: "Repository has separate backend/ and frontend/ dirs — sync frontend to S3 (true/false)"
+        required: false
+        type: string
+        default: "false"
 
 jobs:
   deploy:
@@ -121,6 +126,8 @@ jobs:
       - name: Detect or generate Dockerfile
         if: env.BUILD_APP == 'true'
         working-directory: app_source
+        env:
+          CONTAINER_PORT: ${{ inputs.container_port }}
         run: |
           if [ -f Dockerfile ]; then
             echo "DOCKERFILE_PATH=Dockerfile" >> $GITHUB_ENV
@@ -378,6 +385,60 @@ jobs:
           TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
         run: |
           terraform apply -parallelism=20 -input=false -auto-approve tfplan 2>&1 | tee apply.log
+
+      # ── Monorepo: build React frontend and sync to S3 ────────────────────────
+      - name: Build and sync monorepo frontend to S3
+        if: inputs.is_monorepo == 'true' && env.BUILD_APP == 'true'
+        env:
+          S3_BUCKET: ${{ steps.net.outputs.s3_bucket }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          APP_ENV_VARS: ${{ inputs.app_env_vars }}
+        run: |
+          FRONTEND_DIR=""
+          [ -d "app_source/frontend" ] && FRONTEND_DIR="app_source/frontend"
+          [ -z "$FRONTEND_DIR" ] && [ -d "app_source/client" ] && FRONTEND_DIR="app_source/client"
+
+          if [ -z "$FRONTEND_DIR" ]; then
+            echo "No frontend/ or client/ directory found — skipping S3 sync"
+            exit 0
+          fi
+
+          cd "$FRONTEND_DIR"
+
+          # Skip Next.js — requires static export config; not auto-handled
+          if [ -f package.json ] && grep -q '"next"' package.json; then
+            echo "Next.js frontend detected — skipping static S3 deploy (configure output:'export' in next.config.js)"
+            exit 0
+          fi
+
+          # Detect output dir: Vite → dist/, CRA and everything else → build/
+          DIST_DIR="build"
+          if [ -f package.json ] && (grep -q '"vite"' package.json || grep -q '"@vitejs' package.json); then
+            DIST_DIR="dist"
+          fi
+
+          # Expose app env vars as environment variables for build-time substitution
+          if [ -n "$APP_ENV_VARS" ]; then
+            while IFS='=' read -r KEY VAL; do
+              [[ -z "$KEY" || "$KEY" == \#* ]] && continue
+              export "$KEY=$VAL"
+            done <<< "$APP_ENV_VARS"
+          fi
+
+          npm ci
+          npm run build
+
+          if [ ! -d "$DIST_DIR" ]; then
+            echo "Build output '$DIST_DIR/' not found — skipping S3 sync"
+            exit 0
+          fi
+
+          echo "Syncing $DIST_DIR/ → s3://$S3_BUCKET/ ..."
+          aws s3 sync "$DIST_DIR/" "s3://${S3_BUCKET}/" \
+            --delete \
+            --cache-control "max-age=86400" \
+            --region "$AWS_REGION"
+          echo "Frontend synced to s3://$S3_BUCKET/"
 
       # ── Capture outputs ────────────────────────────────────────────────────
       - name: Capture Terraform Outputs
